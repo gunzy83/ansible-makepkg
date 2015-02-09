@@ -71,8 +71,6 @@ def remove_packages(module, packages):
 
 
 def install_package(module, package):
-    global install_c
-
     if module.params['as_deps']:
         params = '-U --asdeps %s' % package
     else:
@@ -87,8 +85,6 @@ def install_package(module, package):
     install_c += 1
 
 def make_package(module, package, package_file):
-    global output_dir
-
     # Get the user and sudo user
     user = os.environ.get('USER')
     sudo_user = os.environ.get('SUDO_USER') 
@@ -174,21 +170,17 @@ def make_package(module, package, package_file):
     
 
 def make_custom_package(module, package, package_file):
-    global build_c
     package_path = make_package(module, package, package_file)
-    build_c += 1
     makepkg_files[package] = package_path
     return package_path
 
 def make_aur_package(module, package):
-    global build_c
     content = urllib2.urlopen("https://aur.archlinux.org/rpc.php?type=info&arg=%s" % package)
     info = json.load(content)
     pkg_ver = info['results']['Version']
     package_path = query_package_dir(module, package, pkg_ver)
     if not package_path:
         package_path = make_package(module, package, None)
-        build_c += 1
     makepkg_files[package] = package_path
     return package_path
 
@@ -231,57 +223,22 @@ def check_build_environment(module):
 
 
 
-def install_packages(module, packages, package_files):
-    global build_c
-    global install_c
-
+def install_package(module, package, package_file):
+    
     check_build_environment(module)
+    
+    if not query_package(module, package):
+        module.exit_json(changed=False, msg="package already installed")
 
-    build_c = 0
-    install_c = 0
+    if not package_files[i]:
+        # this is an aur package, check pkg cache before install
+        package_path = make_aur_package(module,package)
+    else:
+        package_path = make_custom_package(module, package, package_file)
+    
+    install_package(module, package_path)
 
-    for i, package in enumerate(packages):
-        if query_package(module, package):
-            continue
-
-        if not package_files[i]:
-            # this is an aur package, check pkg cache before install
-            package_path = make_aur_package(module,package)
-
-        else:
-            package_path = make_custom_package(module, package, package_file)
-
-        install_package(module, package_path)
-
-    if install_c > 0:
-        build_msg = ("built %s packages" % build_c) if build_c != 1 else ("built %s package" % build_c)
-        install_msg = ("installed %s packages" % install_c) if install_c != 1 else ("installed %s package" % install_c)
-        module.exit_json(changed=True, msg="%s, %s" % (build_msg,install_msg), pkg_files=makepkg_files)
-
-    module.exit_json(changed=False, msg="package(s) already installed")
-
-def make_packages(module, packages, package_files):
-    global build_c
-
-    check_build_environment(module)
-
-    build_c = 0
-
-    for i, package in enumerate(packages):
-
-        if not package_files[i]:
-            # this is an aur package, check pkg cache before install
-            make_aur_package(module,package)
-
-        else:
-            make_custom_package(module, package, package_file)
-
-    if build_c > 0:
-        build_msg = ("built %s packages" % build_c) if build_c != 1 else ("built %s package" % build_c)
-        module.exit_json(changed=True, msg=build_msg, pkg_files=makepkg_files)
-
-    module.exit_json(changed=False, msg="package(s) already built")
-
+    module.exit_json(changed=True, msg="installed package %s" % package)
 
 def check_packages(module, packages, state):
 
@@ -303,13 +260,14 @@ def check_packages(module, packages, state):
     else:
         module.exit_json(changed=False, msg="package(s) already %s" % state)
 
+
 def main():
     global output_dir
 
     module = AnsibleModule(
         argument_spec    = dict(
-            name         = dict(aliases=['pkgs']),
-            state        = dict(default='present', choices=['installed', 'present', 'absent', 'removed', 'built']),
+            name         = dict(aliases=['pkg']),
+            state        = dict(default='present', choices=['installed', 'present', 'absent', 'removed']),
             recurse      = dict(default='no', choices=BOOLEANS, type='bool'),
             as_deps      = dict(default='no', choices=BOOLEANS, type='bool'),
             output_dir   = dict(default=PACKAGE_DIR)),
@@ -332,27 +290,23 @@ def main():
         p['state'] = 'absent'
 
     if p['name']:
-        pkgs = p['name'].split(',')
+        pkg = p['name']
 
-        pkg_files = []
-        for i, pkg in enumerate(pkgs):
-            if pkg.endswith('.tar.gz'):
-                # The package given is a filename, extract the raw pkg name from
-                # it and store the filename
-                pkg_files.append(pkg)
-                pkgs[i] = re.sub('-[0-9].*$', '', pkgs[i].split('/')[-1])
-            else:
-                pkg_files.append(None)
+        pkg_file = None
 
+        if pkg.endswith('.tar.gz'):
+            # The package given is a filename, extract the raw pkg name from
+            # it and store the filename
+            pkg_file = pkg
+            pkg = re.sub('-[0-9].*$', '', pkgs[i].split('/')[-1])
+        
         if module.check_mode:
             check_packages(module, pkgs, p['state'])
         
         if p['state'] == 'present':
-            install_packages(module, pkgs, pkg_files)
-        elif p['state'] == 'built':
-            make_packages(module, pkgs, pkg_files)
+            install_packages(module, pkg, pkg_file)
         elif p['state'] == 'absent':
-            remove_packages(module, pkgs)
+            remove_packages(module, pkg)
 
 
 # import module snippets
