@@ -17,7 +17,6 @@ import urllib2
 PACMAN_PATH = "/usr/bin/pacman"
 MAKEPKG_PATH = "/usr/bin/makepkg"
 PACKAGE_DIR = "/var/cache/pacman/pkg"
-makepkg_files = dict()
 
 def query_package_dir(module, name, version):
     global output_dir
@@ -42,47 +41,30 @@ def query_package(module, name):
 
     return False 
 
-def remove_packages(module, packages):
+def remove_package(module, package):
     if module.params["recurse"]:
         args = "Rs"
     else:
         args = "R"
 
-    remove_c = 0
     # Using a for loop incase of error, we can report the package that failed
-    for package in packages:
-        # Query the package first, to see if we even need to remove
-        if not query_package(module, package):
-            continue
+    # Query the package first, to see if we even need to remove
+    if not query_package(module, package):
+        continue
 
-        cmd = "pacman -%s %s --noconfirm" % (args, package)
-        rc, stdout, stderr = module.run_command(cmd, check_rc=False)
+    cmd = "pacman -%s %s --noconfirm" % (args, package)
+    rc, stdout, stderr = module.run_command(cmd, check_rc=False)
 
-        if rc != 0:
-            module.fail_json(msg="failed to remove %s" % (package))
-
-        remove_c += 1
+    if rc != 0:
+        module.fail_json(msg="failed to remove %s" % (package))
 
     if remove_c > 0:
         remove_msg = ("removed %s packages" % remove_c) if remove_c !=1 else ("removed %s package" % remove_c)
         module.exit_json(changed=True, msg=remove_msg)
 
     module.exit_json(changed=False, msg="package(s) already absent")
+   
 
-
-def install_package(module, package):
-    if module.params['as_deps']:
-        params = '-U --asdeps %s' % package
-    else:
-        params = '-U %s' % package
-
-    cmd = "pacman %s --noconfirm" % (params)
-    rc, stdout, stderr = module.run_command(cmd, check_rc=False)
-
-    if rc != 0:
-        module.fail_json(msg="failed to install %s" % (package))
-
-    install_c += 1
 
 def make_package(module, package, package_file):
     # Get the user and sudo user
@@ -167,22 +149,7 @@ def make_package(module, package, package_file):
         module.fail_json(msg="failed to remove temporary build directory %s" % (build_dir))
 
     return os.path.join(output_dir,found_file)
-    
 
-def make_custom_package(module, package, package_file):
-    package_path = make_package(module, package, package_file)
-    makepkg_files[package] = package_path
-    return package_path
-
-def make_aur_package(module, package):
-    content = urllib2.urlopen("https://aur.archlinux.org/rpc.php?type=info&arg=%s" % package)
-    info = json.load(content)
-    pkg_ver = info['results']['Version']
-    package_path = query_package_dir(module, package, pkg_ver)
-    if not package_path:
-        package_path = make_package(module, package, None)
-    makepkg_files[package] = package_path
-    return package_path
 
 def check_build_environment(module):
     global output_dir
@@ -230,13 +197,29 @@ def install_package(module, package, package_file):
     if not query_package(module, package):
         module.exit_json(changed=False, msg="package already installed")
 
-    if not package_files[i]:
-        # this is an aur package, check pkg cache before install
-        package_path = make_aur_package(module,package)
-    else:
-        package_path = make_custom_package(module, package, package_file)
+    if not package_file:
+        # this is an aur package
+        content = urllib2.urlopen("https://aur.archlinux.org/rpc.php?type=info&arg=%s" % package)
+        info = json.load(content)
+        pkg_ver = info['results']['Version']
+        # check pkg cache before install
+        package_path = query_package_dir(module, package, pkg_ver)
+        if not package_path:
+            package_path = make_package(module, package, None)
     
-    install_package(module, package_path)
+    else:
+        package_path = make_package(module, package, package_file)
+    
+    if module.params['as_deps']:
+        params = '-U --asdeps %s' % package
+    else:
+        params = '-U %s' % package
+
+    cmd = "pacman %s --noconfirm" % (params)
+    rc, stdout, stderr = module.run_command(cmd, check_rc=False)
+
+    if rc != 0:
+        module.fail_json(msg="failed to install %s" % (package))
 
     module.exit_json(changed=True, msg="installed package %s" % package)
 
