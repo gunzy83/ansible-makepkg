@@ -1,8 +1,89 @@
 #!/usr/bin/python -tt
 # -*- coding: utf-8 -*-
 
-# TODO:
-# 1. Update check mode
+# (c) 2015, Ross Williams <http://github.com/gunzy83>
+#
+# This file is part of Ansible
+#
+# Ansible is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# Ansible is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
+
+DOCUMENTATION = '''
+---
+module: makepkg
+short_description: Build and install packages with I(makepkg) and I(pacman)
+description:
+    - Build  packages with the I(makepkg) and install with I(pacman) package manager, which is used by
+      Arch Linux and its variants.
+version_added: "1.8.2"
+author: Ross Williams
+notes: []
+requirements: [base-devel]
+options:
+    name:
+        description:
+            - Name of the AUR package to build and install or remove. Can also 
+              be the path to a source package to be built.
+        required: true
+        default: null
+
+    state:
+        description:
+            - Desired state of the package.
+        required: true
+        default: "present"
+        choices: ["present", "absent"]
+
+    recurse:
+        description:
+            - When removing a package, also remove its dependencies, provided
+              that they are not required by other packages and were not
+              explicitly installed by a user.
+        required: false
+        default: "no"
+        choices: ["yes", "no"]
+
+    as_deps:
+        description:
+            - Whether or not to install the package with the **--asdeps** flag. 
+              Useful for installing optional or AUR dependencies of AUR packages.
+        required: false
+        default: "no"
+        choices: ["yes", "no"]
+
+    build_dir:
+        description:
+            - Directory to extract source tarball for building the package
+        required: false
+        default: "/var/cache/pacman/pkg"
+'''
+
+EXAMPLES = '''
+# Build and Install package aurvote
+- makepkg: name=aurvote state=present
+
+# Remove package aurvote
+- makepkg: name=aurvote state=absent
+
+# Recursively remove package aurvote
+- makepkg: name=aurvote state=absent recurse=yes
+
+# Build and Install package aurvote as a dependency
+- makepkg: name=aurvote state=present as_deps=yes
+
+# Build in a custom build directory
+- makepkg: name=aurvote state=present build_dir="~/builds"
+'''
 
 import json
 import shlex
@@ -16,17 +97,14 @@ import urllib2
 
 PACMAN_PATH = "/usr/bin/pacman"
 MAKEPKG_PATH = "/usr/bin/makepkg"
-PACKAGE_DIR = "/var/cache/pacman/pkg"
+PACKAGE_CACHE = "/var/cache/pacman/pkg"
 
 def query_package_dir(module, name, version):
-    global output_dir
-
-    found_file = None
+    
     matcher = re.compile('%s-%s[\.xany0-9_-]*\.pkg\.tar\.xz$' % (name,version))
-    for filename in os.listdir(output_dir):
-        # check if filename not found, if not we need to fail out
+    for filename in os.listdir(PACKAGE_CACHE):
         if matcher.match(filename):
-            return os.path.join(output_dir,filename)
+            return os.path.join(PACKAGE_CACHE,filename)
 
     return None
 
@@ -42,15 +120,14 @@ def query_package(module, name):
     return False 
 
 def remove_package(module, package):
+    # Query the package first, to see if we even need to remove
+    if not query_package(module, package):
+        module.exit_json(changed=False, msg="package(s) already absent")
+
     if module.params["recurse"]:
         args = "Rs"
     else:
         args = "R"
-
-    # Using a for loop incase of error, we can report the package that failed
-    # Query the package first, to see if we even need to remove
-    if not query_package(module, package):
-        continue
 
     cmd = "pacman -%s %s --noconfirm" % (args, package)
     rc, stdout, stderr = module.run_command(cmd, check_rc=False)
@@ -58,76 +135,59 @@ def remove_package(module, package):
     if rc != 0:
         module.fail_json(msg="failed to remove %s" % (package))
 
-    if remove_c > 0:
-        remove_msg = ("removed %s packages" % remove_c) if remove_c !=1 else ("removed %s package" % remove_c)
-        module.exit_json(changed=True, msg=remove_msg)
+    remove_msg = "removed package %s" % (package)
+    module.exit_json(changed=True, msg=remove_msg)
 
-    module.exit_json(changed=False, msg="package(s) already absent")
    
+def prepare_build_dir(module, package_name, sudo_user):
+    build_dir = module.params['build_dir']
+    uid = pwd.getpwnam(sudo_user).pw_uid
+    gid = grp.getgrnam('users').gr_gid
 
+    directory = os.path.join(build_dir,package_name)
+    if not os.path.exists(directory):
+        try:
+            os.mkdir(directory,0755)
+        except OSError:
+            module.fail_json(msg="failed to create build directory %s" % (directory))
+
+    if os.stat(directory).st_uid != uid:
+        try:
+            os.chown(directory,uid,gid)
+        except OSError as e:
+            module.fail_json(msg="failed to change owner of build directory %s" % (e.strerror))
+
+    return directory
 
 def make_package(module, package, package_file):
-    # Get the user and sudo user
-    user = os.environ.get('USER')
     sudo_user = os.environ.get('SUDO_USER') 
-    build_user = user 
 
-    # Command prefix for makepkg only
-    command_prefix = ''
+    # Build as user, not as root
+    command_prefix = "sudo -u %s " % sudo_user   
 
-    group_name = 'root'
-    if sudo_user:
-        command_prefix = "sudo -u %s " % sudo_user
-        build_user = sudo_user
-        group_name = 'users'
-
-    if user != 'root':
-        group_name = 'users'
-
-    uid = pwd.getpwnam(build_user).pw_uid
-    gid = grp.getgrnam(group_name).gr_gid
-
-    build_dir = os.path.join(output_dir,package)
-    if not os.path.exists(build_dir):
-        try:
-            os.mkdir(build_dir,0755)
-        except OSError:
-            module.fail_json(msg="failed to create build directory %s" % (build_dir))
-
-        if os.stat(build_dir).st_uid != uid:
-            try:
-                os.chown(build_dir,uid,gid)
-            except OSError as e:
-                module.fail_json(msg="failed to change owner of build directory %s" % (e.strerror))
-
-    # get the source tarball
+    build_dir = prepare_build_dir(module, package, sudo_user)
+    
     cmd = ""
     if package_file:
         #copy file
-        cmd = "%scp %s ." % (command_prefix, package_file)
+        cmd = "%scp %s ./%s.tar.gz" % (command_prefix, package_file, package)
     else:
         cmd = "%scurl -O https://aur.archlinux.org/packages/%s/%s/%s.tar.gz" % (command_prefix, (package[:2]), package, package)
     
     rc, stdout, stderr = module.run_command(cmd, check_rc=False, cwd=build_dir)
     if rc != 0:
         module.fail_json(msg="failed to fetch tarball for package %s" % (package))
-
-    # untar the source tarball
-    cmd = '%star --strip-components 1 -xf %s.tar.gz' % (command_prefix, package)
+    
+    cmd = '%star --strip-components=1 -xf %s.tar.gz' % (command_prefix, package)
     rc, stdout, stderr = module.run_command(cmd, check_rc=False, cwd=build_dir)
     if rc != 0:
         module.fail_json(msg="failed to extract tarball for package %s" % (package))
 
-    # run the makepkg with the required prefix and/or suffix
-    suffix = ''
-    if not sudo_user and user == 'root':
-        suffix = ' --asroot'
-    cmd = '%smakepkg -cf%s' % (command_prefix, suffix)   
+    cmd = '%smakepkg -cf' % (command_prefix)
     rc, stdout, stderr = module.run_command(cmd, check_rc=False, cwd=build_dir)
     if rc != 0:
         module.fail_json(msg="failed to build package %s" % (package)) 
-
-    ## Find the package and move it to the output location and clean up after the build... add the full path to the built_pkgs list
+    
     found_file = None
     matcher = re.compile('%s-[\.xany0-9_-]*\.pkg\.tar\.xz$' % package)
     for filename in os.listdir(build_dir):
@@ -138,63 +198,46 @@ def make_package(module, package, package_file):
     if not found_file:
         module.fail_json(msg="failed to find the built package for package %s" % package)
 
-    cmd = 'cp %s %s' % (found_file, output_dir)
+    # Keep package in cache for downgrades later
+    cmd = 'cp %s %s' % (found_file, PACKAGE_CACHE)
     rc, stdout, stderr = module.run_command(cmd, check_rc=False, cwd=build_dir)
     if rc != 0:
-        module.fail_json(msg="failed to copy package %s to output directory %s." % (found_file, output_dir))
-
+        module.fail_json(msg="failed to copy package %s to cache directory %s." % (found_file, output_dir))
+    
+    # Don't leave build files lying around
     try:
         shutil.rmtree(build_dir)
     except error:
         module.fail_json(msg="failed to remove temporary build directory %s" % (build_dir))
 
-    return os.path.join(output_dir,found_file)
+    return os.path.join(PACKAGE_CACHE,found_file)
 
 
 def check_build_environment(module):
-    global output_dir
-
+    
     user = os.environ.get('USER')
+    sudo_user = os.environ.get('SUDO_USER')
+    build_dir = module.params['build_dir']
+
+    # We want to build as user, not as root
+    if not sudo_user:
+        module.fail_json(msg="building as root not permitted, run as user and use sudo")
+
     # Check if we need to be able to install package and fail out if we can't
-    if module.params['state'] == 'present' and user != 'root':
-        module.fail_json(msg="sudo or root required to install package")
+    if user != 'root':
+        module.fail_json(msg="sudo required to install package")
 
-    if not os.path.exists(output_dir):
-        module.fail_json(msg="base build directory %s does not exist" % output_dir)
+    if not os.path.exists(build_dir):
+        module.fail_json(msg="base build directory %s does not exist" % build_dir)
 
-    if not os.access(output_dir, os.W_OK):
-        module.fail_json(msg="base build directory %s is not accessible" % output_dir)
-
-    # check for base-devel package group
-    if user=='root':
-        cmd = "pacman -S base-devel --needed --noconfirm"
-        rc, stdout, stderr = module.run_command(cmd, check_rc=False)
-
-        if rc != 0:
-            module.fail_json(msg="failed to find/install base-devel")  
-
-    else:
-        cmd = "pacman -Sg base-devel | cut -d' ' -f2"
-        rc, stdout, stderr = module.run_command(cmd, check_rc=False, use_unsafe_shell=True)
-
-        if rc != 0:
-            module.fail_json(msg="failed to find base-devel group")
-
-        pkg_list = stdout.split("\n")
-        for package in pkg_list:
-            cmd = "pacman -Q %s" % package
-            rc, stdout, stderr = module.run_command(cmd, check_rc=False)
-
-            if rc != 0:
-                module.fail_json(msg="base-devel package %s is missing, please install it" % package)
-
-
+    if not os.access(build_dir, os.W_OK):
+        module.fail_json(msg="base build directory %s is not accessible" % build_dir)
 
 def install_package(module, package, package_file):
     
     check_build_environment(module)
     
-    if not query_package(module, package):
+    if query_package(module, package):
         module.exit_json(changed=False, msg="package already installed")
 
     if not package_file:
@@ -211,9 +254,9 @@ def install_package(module, package, package_file):
         package_path = make_package(module, package, package_file)
     
     if module.params['as_deps']:
-        params = '-U --asdeps %s' % package
+        params = '-U --asdeps %s' % package_path
     else:
-        params = '-U %s' % package
+        params = '-U %s' % package_path
 
     cmd = "pacman %s --noconfirm" % (params)
     rc, stdout, stderr = module.run_command(cmd, check_rc=False)
@@ -223,37 +266,34 @@ def install_package(module, package, package_file):
 
     module.exit_json(changed=True, msg="installed package %s" % package)
 
-def check_packages(module, packages, state):
+def check_package(module, package, state):
+    changed = False
+    installed = query_package(module, package)
+    if (state == "present" and not installed):
+        # if the build would fail because of the state of the system we want to know
+        check_build_environment(module)
+        state = "installed"
+        changed = True
 
-    ########## TBC ############
+    if (state == "absent" and installed):
+        state = "removed"
+        changed = True
 
-    would_be_changed = []
-    for package in packages:
-        installed = query_package(module, package)
-        if ((state == "present" and not installed) or
-                (state == "absent" and installed)):
-            would_be_changed.append(package)
-    if would_be_changed:
-        if state == "absent":
-            state = "removed"
-        # Add this to pacman module and submit pull
-        if state == "present":
-            state = "installed"
-        module.exit_json(changed=True, msg="%s package(s) would be %s" % (len(would_be_changed), state))
+    if changed:
+        module.exit_json(changed=True, msg="package %s would be %s" % (package, state))
     else:
-        module.exit_json(changed=False, msg="package(s) already %s" % state)
+        module.exit_json(changed=False, msg="package %s already %s" % (package, state))
 
 
-def main():
-    global output_dir
+def main():    
 
     module = AnsibleModule(
         argument_spec    = dict(
-            name         = dict(aliases=['pkg']),
-            state        = dict(default='present', choices=['installed', 'present', 'absent', 'removed']),
+            name         = dict(aliases=['pkg'], required=True),
+            state        = dict(choices=['installed', 'present', 'absent', 'removed'], required=True),
             recurse      = dict(default='no', choices=BOOLEANS, type='bool'),
             as_deps      = dict(default='no', choices=BOOLEANS, type='bool'),
-            output_dir   = dict(default=PACKAGE_DIR)),
+            build_dir    = dict(default=PACKAGE_CACHE)),
         required_one_of = [['name']],
         supports_check_mode = True)
 
@@ -264,32 +304,27 @@ def main():
 
     p = module.params
 
-    output_dir = p['output_dir']
-
     # normalize the state parameter
     if p['state'] in ['present', 'installed']:
         p['state'] = 'present'
     elif p['state'] in ['absent', 'removed']:
         p['state'] = 'absent'
 
-    if p['name']:
-        pkg = p['name']
-
-        pkg_file = None
-
-        if pkg.endswith('.tar.gz'):
-            # The package given is a filename, extract the raw pkg name from
-            # it and store the filename
-            pkg_file = pkg
-            pkg = re.sub('-[0-9].*$', '', pkgs[i].split('/')[-1])
-        
-        if module.check_mode:
-            check_packages(module, pkgs, p['state'])
-        
-        if p['state'] == 'present':
-            install_packages(module, pkg, pkg_file)
-        elif p['state'] == 'absent':
-            remove_packages(module, pkg)
+    pkg = p['name']
+    pkg_file = None
+    if pkg.endswith('.tar.gz'):
+        # The package given is a filename, extract the raw pkg name from
+        # it and store the filename
+        pkg_file = pkg
+        pkg = re.sub('[-.].*$', '', pkg.split('/')[-1])
+     
+    if module.check_mode:
+        check_package(module, pkg, p['state'])
+     
+    if p['state'] == 'present':
+        install_package(module, pkg, pkg_file)
+    elif p['state'] == 'absent':
+        remove_package(module, pkg)
 
 
 # import module snippets
