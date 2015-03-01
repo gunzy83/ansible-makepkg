@@ -39,6 +39,12 @@ Example Plays
 	    state: present
 	    as_deps: true
 
+	- name: Ensure aurvote is installed but built in a custom build directory
+	  makepkg: 
+	    name: aurvote
+	    state: present
+	    build_dir: "~/builds"
+
 Future Plans
 ============
 
