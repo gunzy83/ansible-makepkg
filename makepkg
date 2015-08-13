@@ -160,10 +160,10 @@ def prepare_build_dir(module, package_name, sudo_user):
     return directory
 
 def make_package(module, package, package_file):
-    sudo_user = os.environ.get('SUDO_USER') 
+    sudo_user = os.environ.get('SUDO_USER')
 
     # Build as user, not as root
-    command_prefix = "sudo -u %s " % sudo_user   
+    command_prefix = "sudo -u %s " % sudo_user
 
     build_dir = prepare_build_dir(module, package, sudo_user)
     
@@ -172,24 +172,25 @@ def make_package(module, package, package_file):
         #copy file
         cmd = "%scp %s ./%s.tar.gz" % (command_prefix, package_file, package)
     else:
-        cmd = "%scurl -O https://aur.archlinux.org/packages/%s/%s/%s.tar.gz" % (command_prefix, (package[:2]), package, package)
-    
-    rc, stdout, stderr = module.run_command(cmd, check_rc=False, cwd=build_dir)
-    if rc != 0:
-        module.fail_json(msg="failed to fetch tarball for package %s" % (package))
-    
-    cmd = '%star --strip-components=1 -xf %s.tar.gz' % (command_prefix, package)
-    rc, stdout, stderr = module.run_command(cmd, check_rc=False, cwd=build_dir)
-    if rc != 0:
-        module.fail_json(msg="failed to extract tarball for package %s" % (package))
+        cmd = "%sgit clone --depth=1 https://aur.archlinux.org/%s.git ." % (command_prefix, package)
 
-    cmd = '%smakepkg -cf' % (command_prefix)
     rc, stdout, stderr = module.run_command(cmd, check_rc=False, cwd=build_dir)
     if rc != 0:
-        module.fail_json(msg="failed to build package %s" % (package)) 
+        module.fail_json(msg="failed to clone git repository for package %s" % (package))
+
+    if package_file:
+        cmd = '%star --strip-components=1 -xf %s.tar.gz' % (command_prefix, package)
+        rc, stdout, stderr = module.run_command(cmd, check_rc=False, cwd=build_dir)
+        if rc != 0:
+            module.fail_json(msg="failed to extract tarball for package %s" % (package))
+
+    cmd = '%smakepkg -scf --noconfirm' % (command_prefix)
+    rc, stdout, stderr = module.run_command(cmd, check_rc=False, cwd=build_dir)
+    if rc != 0:
+        module.fail_json(msg="failed to build package %s in %s. stderr: %s" % (package, build_dir, stderr)) 
     
     found_file = None
-    matcher = re.compile('%s-[\.xany0-9_-]*\.pkg\.tar\.xz$' % package)
+    matcher = re.compile('%s-.*\.pkg\.tar\.xz$' % package)
     for filename in os.listdir(build_dir):
         # check if filename not found, if not we need to fail out
         if matcher.match(filename):
@@ -199,11 +200,11 @@ def make_package(module, package, package_file):
         module.fail_json(msg="failed to find the built package for package %s" % package)
 
     # Keep package in cache for downgrades later
-    cmd = 'cp %s %s' % (found_file, PACKAGE_CACHE)
+    cmd = 'sudo cp %s %s' % (found_file, PACKAGE_CACHE)
     rc, stdout, stderr = module.run_command(cmd, check_rc=False, cwd=build_dir)
     if rc != 0:
         module.fail_json(msg="failed to copy package %s to cache directory %s." % (found_file, output_dir))
-    
+
     # Don't leave build files lying around
     try:
         shutil.rmtree(build_dir)
@@ -224,17 +225,18 @@ def check_build_environment(module):
         module.fail_json(msg="building as root not permitted, run as user and use sudo")
 
     # Check if we need to be able to install package and fail out if we can't
-    if user != 'root':
-        module.fail_json(msg="sudo required to install package")
+    if user == 'root':
+        module.fail_json(msg="cannot use makepkg as root")
 
     if not os.path.exists(build_dir):
         module.fail_json(msg="base build directory %s does not exist" % build_dir)
 
-    if not os.access(build_dir, os.W_OK):
-        module.fail_json(msg="base build directory %s is not accessible" % build_dir)
-
 def install_package(module, package, package_file):
-    
+    sudo_user = os.environ.get('SUDO_USER')
+
+    # Build as user, not as root
+    command_prefix = "sudo -u %s " % sudo_user
+
     check_build_environment(module)
     
     if query_package(module, package):
@@ -258,11 +260,12 @@ def install_package(module, package, package_file):
     else:
         params = '-U %s' % package_path
 
-    cmd = "pacman %s --noconfirm" % (params)
+    # User needs sudo privileges to be able to run pacman -U
+    cmd = "sudo pacman %s --noconfirm" % (params)
     rc, stdout, stderr = module.run_command(cmd, check_rc=False)
 
     if rc != 0:
-        module.fail_json(msg="failed to install %s" % (package))
+        module.fail_json(msg="failed to install %s %s %s" % (package, command_prefix, package_path))
 
     module.exit_json(changed=True, msg="installed package %s" % package)
 
@@ -330,4 +333,4 @@ def main():
 # import module snippets
 from ansible.module_utils.basic import *
     
-main() 
+main()
