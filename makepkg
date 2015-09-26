@@ -178,7 +178,6 @@ def make_package(module, pkg, pkg_file_src):
             shutil.copy2(pkg_file_src, build_dir)
         except Exception, err:
             module.fail_json(msg="failed to copy package %s to build directory %s: %s" % (pkg_file_src, build_dir, str(err)))
-
     else:
         aur_req = urlparse.urlunsplit((AUR_SCHEME, AUR_NETLOC, "%s/%s" % (AUR_SNAPSHOT_PATH, pkg_file_basename), "", ""))
         rsp, info = fetch_url(module, aur_req)
