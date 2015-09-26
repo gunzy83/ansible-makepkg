@@ -319,8 +319,7 @@ def check_package(module, pkg, state):
 
 def main():
 
-    argument_spec = url_argument_spec()
-    argument_spec.update(
+    argument_spec = dict(
         name         = dict(aliases=['pkg'], required=True),
         state        = dict(choices=['installed', 'present', 'absent', 'removed'], required=True),
         recurse      = dict(default='no', choices=BOOLEANS, type='bool'),
