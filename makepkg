@@ -32,7 +32,7 @@ requirements: [base-devel]
 options:
     name:
         description:
-            - Name of the AUR package to build and install or remove. Can also 
+            - Name of the AUR package to build and install or remove. Can also
               be the path to a source package to be built.
         required: true
         default: null
@@ -55,7 +55,7 @@ options:
 
     as_deps:
         description:
-            - Whether or not to install the package with the **--asdeps** flag. 
+            - Whether or not to install the package with the **--asdeps** flag.
               Useful for installing optional or AUR dependencies of AUR packages.
         required: false
         default: "no"
@@ -86,21 +86,24 @@ EXAMPLES = '''
 '''
 
 import json
-import shlex
 import os
 import re
-import sys
 import pwd
 import grp
 import shutil
-import urllib2
+import urllib
+import urlparse
 
 PACMAN_PATH = "/usr/bin/pacman"
 MAKEPKG_PATH = "/usr/bin/makepkg"
 PACKAGE_CACHE = "/var/cache/pacman/pkg"
+AUR_SCHEME = "https"
+AUR_NETLOC = "aur.archlinux.org"
+AUR_RPC_PATH = "rpc.php"
+AUR_SNAPSHOT_PATH = "cgit/aur.git/snapshot"
 
 def query_package_dir(module, name, version):
-    
+
     matcher = re.compile('%s-%s[\.xany0-9_-]*\.pkg\.tar\.xz$' % (name,version))
     for filename in os.listdir(PACKAGE_CACHE):
         if matcher.match(filename):
@@ -117,11 +120,11 @@ def query_package(module, name):
     if rc == 0:
         return True
 
-    return False 
+    return False
 
-def remove_package(module, package):
+def remove_package(module, pkg):
     # Query the package first, to see if we even need to remove
-    if not query_package(module, package):
+    if not query_package(module, pkg):
         module.exit_json(changed=False, msg="package(s) already absent")
 
     if module.params["recurse"]:
@@ -129,25 +132,23 @@ def remove_package(module, package):
     else:
         args = "R"
 
-    cmd = "pacman -%s %s --noconfirm" % (args, package)
+    cmd = "pacman -%s %s --noconfirm" % (args, pkg)
     rc, stdout, stderr = module.run_command(cmd, check_rc=False)
 
     if rc != 0:
-        module.fail_json(msg="failed to remove %s" % (package))
+        module.fail_json(msg="failed to remove package %s" % pkg)
 
-    remove_msg = "removed package %s" % (package)
-    module.exit_json(changed=True, msg=remove_msg)
+    module.exit_json(changed=True, msg="removed package %s" % pkg)
 
-   
-def prepare_build_dir(module, package_name, sudo_user):
+def prepare_build_dir(module, pkg_name, sudo_user):
     build_dir = module.params['build_dir']
     uid = pwd.getpwnam(sudo_user).pw_uid
     gid = grp.getgrnam('users').gr_gid
 
-    directory = os.path.join(build_dir,package_name)
+    directory = os.path.join(build_dir, pkg_name)
     if not os.path.exists(directory):
         try:
-            os.mkdir(directory,0755)
+            os.mkdir(directory, 0755)
         except OSError:
             module.fail_json(msg="failed to create build directory %s" % (directory))
 
@@ -159,62 +160,81 @@ def prepare_build_dir(module, package_name, sudo_user):
 
     return directory
 
-def make_package(module, package, package_file):
-    sudo_user = os.environ.get('SUDO_USER') 
+def make_package(module, pkg, pkg_file_src):
+    sudo_user = os.environ.get('SUDO_USER')
 
     # Build as user, not as root
-    command_prefix = "sudo -u %s " % sudo_user   
+    command_prefix = "sudo -u %s " % sudo_user
 
-    build_dir = prepare_build_dir(module, package, sudo_user)
-    
+    build_dir = prepare_build_dir(module, pkg, sudo_user)
+
     cmd = ""
-    if package_file:
-        #copy file
-        cmd = "%scp %s ./%s.tar.gz" % (command_prefix, package_file, package)
-    else:
-        cmd = "%scurl -O https://aur.archlinux.org/packages/%s/%s/%s.tar.gz" % (command_prefix, (package[:2]), package, package)
-    
-    rc, stdout, stderr = module.run_command(cmd, check_rc=False, cwd=build_dir)
-    if rc != 0:
-        module.fail_json(msg="failed to fetch tarball for package %s" % (package))
-    
-    cmd = '%star --strip-components=1 -xf %s.tar.gz' % (command_prefix, package)
-    rc, stdout, stderr = module.run_command(cmd, check_rc=False, cwd=build_dir)
-    if rc != 0:
-        module.fail_json(msg="failed to extract tarball for package %s" % (package))
+    pkg_file_basename = "%s.tar.gz" % pkg
+    pkg_file_dest = os.path.join(build_dir, pkg_file_basename)
 
-    cmd = '%smakepkg -cf' % (command_prefix)
+    if pkg_file_src:
+        # copy file to build directory
+        try:
+            shutil.copy2(pkg_file_src, build_dir)
+        except Exception, err:
+            module.fail_json(msg="failed to copy package %s to build directory %s: %s" % (pkg_file_src, build_dir, str(err)))
+    else:
+        aur_req = urlparse.urlunsplit((AUR_SCHEME, AUR_NETLOC, "%s/%s" % (AUR_SNAPSHOT_PATH, pkg_file_basename), "", ""))
+        rsp, info = fetch_url(module, aur_req)
+
+        if info['status'] != 200:
+            module.fail_json(msg="Request failed", url=aur_req, status_code=info['status'], response=info['msg'])
+
+        # save response to archive
+        f = open(pkg_file_dest, 'wb')
+        try:
+            shutil.copyfileobj(rsp, f)
+        except Exception, err:
+            os.remove(pkg_file_dest)
+            module.fail_json(msg="failed to create package archive file: %s" % str(err))
+        f.close()
+        rsp.close()
+
+    pkg_file = pkg_file_dest
+
+    if pkg_file:
+        cmd = '%star --strip-components=1 -xf %s.tar.gz' % (command_prefix, pkg)
+        rc, stdout, stderr = module.run_command(cmd, check_rc=False, cwd=build_dir)
+        if rc != 0:
+            module.fail_json(msg="failed to extract %s for pkg %s" % (pkg_file, pkg), stderr=stderr)
+
+    cmd = '%smakepkg -scf --noconfirm' % command_prefix
     rc, stdout, stderr = module.run_command(cmd, check_rc=False, cwd=build_dir)
     if rc != 0:
-        module.fail_json(msg="failed to build package %s" % (package)) 
-    
+        module.fail_json(msg="failed to build package %s in %s from %s" % (pkg, pkg_file, build_dir), stderr=stderr)
+
     found_file = None
-    matcher = re.compile('%s-[\.xany0-9_-]*\.pkg\.tar\.xz$' % package)
+    matcher = re.compile('%s-.*\.pkg\.tar\.xz$' % pkg)
     for filename in os.listdir(build_dir):
         # check if filename not found, if not we need to fail out
         if matcher.match(filename):
             found_file = filename
 
     if not found_file:
-        module.fail_json(msg="failed to find the built package for package %s" % package)
+        module.fail_json(msg="failed to find the built package for %s" % pkg)
 
-    # Keep package in cache for downgrades later
-    cmd = 'cp %s %s' % (found_file, PACKAGE_CACHE)
-    rc, stdout, stderr = module.run_command(cmd, check_rc=False, cwd=build_dir)
-    if rc != 0:
-        module.fail_json(msg="failed to copy package %s to cache directory %s." % (found_file, output_dir))
-    
+    # Keep package in cache for downgrades later.  Use shutil.copy since we
+    # don't care about preserving permissions.
+    try:
+        shutil.copy(os.path.join(build_dir, found_file), PACKAGE_CACHE)
+    except Exception, err:
+        module.fail_json("Failed to copy package %s to cache %s: %s" % (found_file, PACKAGE_CACHE, str(err)))
+
     # Don't leave build files lying around
     try:
         shutil.rmtree(build_dir)
-    except error:
-        module.fail_json(msg="failed to remove temporary build directory %s" % (build_dir))
+    except Exception, err:
+        module.fail_json(msg="failed to remove temporary build directory %s: %s" % (build_dir, str(err)))
 
     return os.path.join(PACKAGE_CACHE,found_file)
 
 
 def check_build_environment(module):
-    
     user = os.environ.get('USER')
     sudo_user = os.environ.get('SUDO_USER')
     build_dir = module.params['build_dir']
@@ -223,9 +243,9 @@ def check_build_environment(module):
     if not sudo_user:
         module.fail_json(msg="building as root not permitted, run as user and use sudo")
 
-    # Check if we need to be able to install package and fail out if we can't
+    # Check if we need to be able to install pkg and fail out if we can't
     if user != 'root':
-        module.fail_json(msg="sudo required to install package")
+        module.fail_json(msg="sudo required to install packages")
 
     if not os.path.exists(build_dir):
         module.fail_json(msg="base build directory %s does not exist" % build_dir)
@@ -233,42 +253,54 @@ def check_build_environment(module):
     if not os.access(build_dir, os.W_OK):
         module.fail_json(msg="base build directory %s is not accessible" % build_dir)
 
-def install_package(module, package, package_file):
-    
+def install_package(module, pkg, pkg_file):
     check_build_environment(module)
-    
-    if query_package(module, package):
-        module.exit_json(changed=False, msg="package already installed")
 
-    if not package_file:
-        # this is an aur package
-        content = urllib2.urlopen("https://aur.archlinux.org/rpc.php?type=info&arg=%s" % package)
-        info = json.load(content)
-        pkg_ver = info['results']['Version']
+    if query_package(module, pkg):
+        module.exit_json(changed=False, msg="package already installed", package=pkg)
+
+    if not pkg_file:
+        # this is an aur pkg
+        rpc_params = urllib.urlencode({"type": "info", "arg": pkg})
+        rpc_req = urlparse.urlunsplit((AUR_SCHEME, AUR_NETLOC, AUR_RPC_PATH, rpc_params, ""))
+        rsp, info = fetch_url(module, rpc_req)
+
+        # create a temporary file and copy content to do checksum-based replacement
+        if info['status'] != 200:
+            module.fail_json(msg="Request failed", status_code=info['status'], response=info['msg'], url=rpc_req)
+
+        pkg_info = json.load(rsp)
+
+        if pkg_info['resultcount'] < 1:
+            module.fail_json(msg="AUR query found no matching packages", package=pkg)
+
         # check pkg cache before install
-        package_path = query_package_dir(module, package, pkg_ver)
-        if not package_path:
-            package_path = make_package(module, package, None)
-    
+        pkg_ver = pkg_info['results']['Version']
+        pkg_path = query_package_dir(module, pkg, pkg_ver)
+        if not pkg_path:
+            pkg_path = make_package(module, pkg, None)
+
     else:
-        package_path = make_package(module, package, package_file)
-    
+        pkg_path = make_package(module, pkg, pkg_file)
+
     if module.params['as_deps']:
-        params = '-U --asdeps %s' % package_path
+        params = '-U --asdeps %s' % pkg_path
     else:
-        params = '-U %s' % package_path
+        params = '-U %s' % pkg_path
 
     cmd = "pacman %s --noconfirm" % (params)
     rc, stdout, stderr = module.run_command(cmd, check_rc=False)
 
     if rc != 0:
-        module.fail_json(msg="failed to install %s" % (package))
+        module.fail_json(msg="failed to install package", pkg=pkg, stderr=stderr)
 
-    module.exit_json(changed=True, msg="installed package %s" % package)
+    module.exit_json(changed=True, msg="installed package", pkg=pkg)
 
-def check_package(module, package, state):
+def check_package(module, pkg, state):
+
     changed = False
-    installed = query_package(module, package)
+    installed = query_package(module, pkg)
+
     if (state == "present" and not installed):
         # if the build would fail because of the state of the system we want to know
         check_build_environment(module)
@@ -280,22 +312,26 @@ def check_package(module, package, state):
         changed = True
 
     if changed:
-        module.exit_json(changed=True, msg="package %s would be %s" % (package, state))
+        module.exit_json(changed=True, msg="package would be %s" % state, package=pkg)
     else:
-        module.exit_json(changed=False, msg="package %s already %s" % (package, state))
+        module.exit_json(changed=False, msg="package already %s" % state, package=pkg)
 
 
-def main():    
+def main():
+
+    argument_spec = dict(
+        name         = dict(aliases=['pkg'], required=True),
+        state        = dict(choices=['installed', 'present', 'absent', 'removed'], required=True),
+        recurse      = dict(default='no', choices=BOOLEANS, type='bool'),
+        as_deps      = dict(default='no', choices=BOOLEANS, type='bool'),
+        build_dir    = dict(default=PACKAGE_CACHE)
+    )
 
     module = AnsibleModule(
-        argument_spec    = dict(
-            name         = dict(aliases=['pkg'], required=True),
-            state        = dict(choices=['installed', 'present', 'absent', 'removed'], required=True),
-            recurse      = dict(default='no', choices=BOOLEANS, type='bool'),
-            as_deps      = dict(default='no', choices=BOOLEANS, type='bool'),
-            build_dir    = dict(default=PACKAGE_CACHE)),
+        argument_spec = argument_spec,
         required_one_of = [['name']],
-        supports_check_mode = True)
+        supports_check_mode = True
+    )
 
     if not os.path.exists(PACMAN_PATH):
         module.fail_json(msg="cannot find pacman, looking for %s" % (PACMAN_PATH))
@@ -316,18 +352,20 @@ def main():
         # The package given is a filename, extract the raw pkg name from
         # it and store the filename
         pkg_file = pkg
-        pkg = re.sub('[-.].*$', '', pkg.split('/')[-1])
-     
+        pkg = os.path.basename(pkg)[:-1 * len('.tar.gz')]
+
     if module.check_mode:
         check_package(module, pkg, p['state'])
-     
+
     if p['state'] == 'present':
         install_package(module, pkg, pkg_file)
     elif p['state'] == 'absent':
         remove_package(module, pkg)
 
+# Used for downloading packages from the AUR
+from ansible.module_utils.urls import *
 
 # import module snippets
 from ansible.module_utils.basic import *
-    
-main() 
+
+main()
