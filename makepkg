@@ -92,7 +92,7 @@ import pwd
 import grp
 import shutil
 import urllib
-from ansible.module_utils.six.moves.urllib.parse import urlsplit
+from ansible.module_utils.six.moves.urllib.parse import urlunsplit
 
 PACMAN_PATH = "/usr/bin/pacman"
 MAKEPKG_PATH = "/usr/bin/makepkg"
